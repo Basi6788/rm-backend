@@ -89,7 +89,7 @@ app.post('/api/webhook/clerk', async (req, res) => {
     try {
       const uid = await generateUniqueUID();
       await supabase1.from('users').insert({
-        clerk_id: clerkId, email, first_name: first_name || '', last_name: last_name || '', uid, created_at: new Date().toISOString(),
+        clerk_id: clerkId, email, first_name: first_name || '', last_name: last_name || '', uid, activated: false, created_at: new Date().toISOString(),
       });
     } catch (e) {
       return res.status(500).json({ error: 'Server error' });
@@ -98,23 +98,25 @@ app.post('/api/webhook/clerk', async (req, res) => {
   res.status(200).json({ received: true });
 });
 
-// ── GET UID (WITH AUTO-SYNC FIX) ──────────────────────────────
+// ── GET UID (WITH AUTO-SYNC FIX & ACTIVATION STATUS) ──────────
 app.post('/api/uid', secureClient, decryptBody, async (req, res) => {
   const { clerkId } = req.decrypted;
   if (!clerkId) return res.status(400).json({ error: 'Missing clerkId' });
 
-  let { data, error } = await supabase1.from('users').select('uid, email, first_name, last_name').eq('clerk_id', clerkId).single();
+  // 🔥 FIX: 'activated' ko select query mein add kiya hai
+  let { data, error } = await supabase1.from('users').select('uid, email, first_name, last_name, activated').eq('clerk_id', clerkId).single();
 
-  // Agar Webhook Vercel tak na pohancha ho, toh ye khud user bana dega
   if (error || !data) {
     console.log(`⚠️ Webhook Missed! Auto-syncing ClerkID: ${clerkId}`);
     const newUid = await generateUniqueUID();
     await supabase1.from('users').insert({
-      clerk_id: clerkId, email: 'operator@rmmdm.io', first_name: 'Operator', uid: newUid, created_at: new Date().toISOString(),
+      clerk_id: clerkId, email: 'operator@rmmdm.io', first_name: 'Operator', uid: newUid, activated: false, created_at: new Date().toISOString(),
     });
-    data = { uid: newUid, email: 'operator@rmmdm.io', first_name: 'Operator', last_name: '' };
+    data = { uid: newUid, email: 'operator@rmmdm.io', first_name: 'Operator', last_name: '', activated: false };
   }
-  res.json({ payload: encrypt({ uid: data.uid, email: data.email, firstName: data.first_name, lastName: data.last_name }) });
+  
+  // 🔥 FIX: Frontend ko 'activated' status lazmi bhejna hai
+  res.json({ payload: encrypt({ uid: data.uid, email: data.email, firstName: data.first_name, lastName: data.last_name, activated: data.activated }) });
 });
 
 // ── ACTIVATION — Step Validator ───────────────────────────────
@@ -123,10 +125,14 @@ const STEP_MIN_MS = 5000;
 app.post('/api/activation/init', secureClient, decryptBody, async (req, res) => {
   const { clerkId } = req.decrypted;
   if (!clerkId) return res.status(400).json({ error: 'Missing clerkId' });
-  const { data } = await supabase1.from('users').select('uid').eq('clerk_id', clerkId).single();
+  
+  // 🔥 FIX: Yahan bhi 'activated' select karna hai
+  const { data } = await supabase1.from('users').select('uid, activated').eq('clerk_id', clerkId).single();
   if (!data) return res.status(404).json({ error: 'User not found' });
+  
   const token = encrypt({ step: 1, timestamp: Date.now(), uid: data.uid, clerkId });
-  res.json({ payload: encrypt({ token, step: 1 }) });
+  // 🔥 FIX: Frontend ko batana hai ke user already activated hai ya nahi
+  res.json({ payload: encrypt({ token, step: 1, alreadyActivated: data.activated }) });
 });
 
 app.post('/api/activation/step', secureClient, decryptBody, async (req, res) => {
@@ -143,6 +149,7 @@ app.post('/api/activation/step', secureClient, decryptBody, async (req, res) => 
 
   const newToken = encrypt({ step: nextStep, timestamp: Date.now(), uid: prev.uid, clerkId: prev.clerkId });
   if (nextStep === 5) {
+    // User finally activate ho raha hai
     await supabase1.from('users').update({ activated: true, activated_at: new Date().toISOString() }).eq('clerk_id', prev.clerkId);
     return res.json({ payload: encrypt({ complete: true, uid: prev.uid }) });
   }
