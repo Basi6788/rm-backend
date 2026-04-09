@@ -9,6 +9,8 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const ENC_KEY = process.env.ENCRYPTION_KEY;
 
+if (!ENC_KEY) { console.error('FATAL: ENCRYPTION_KEY missing'); }
+
 // ── Supabase clients ──────────────────────────────────────────
 const supabase1 = createClient(process.env.SUPABASE_URL_1, process.env.SUPABASE_KEY_1);
 const supabase2 = createClient(process.env.SUPABASE_URL_2, process.env.SUPABASE_KEY_2);
@@ -36,15 +38,14 @@ function decryptBody(req, res, next) {
   try {
     console.log(`\n========================================`);
     console.log(`⚡ [API HIT] : ${req.method} ${req.originalUrl}`);
-    console.log(`🔑 [VERCEL KEY STATUS]:`, ENC_KEY ? `✅ FOUND (${ENC_KEY.substring(0,4)}...)` : `❌ MISSING KEY IN VERCEL SETTINGS!`);
 
     if (req.body && req.body.payload) {
       req.decrypted = decrypt(req.body.payload);
     }
     next();
   } catch (e) {
-    console.error(`❌ [DECRYPTION FAILED]: Vercel pe ENCRYPTION_KEY match nahi ho rahi!`);
-    return res.status(400).json({ error: 'Decryption failed. Check Vercel Environment Variables.' });
+    console.error(`❌ [DECRYPTION FAILED]: Invalid payload at ${req.originalUrl}`);
+    return res.status(400).json({ error: 'Decryption failed. Check Keys.' });
   }
 }
 
@@ -86,28 +87,27 @@ app.post('/api/webhook/clerk', async (req, res) => {
   if (evt.type === 'user.created') {
     const { id: clerkId, email_addresses, first_name, last_name } = evt.data;
     const email = email_addresses[0]?.email_address || '';
+    const { data: existing } = await supabase1.from('users').select('uid').eq('clerk_id', clerkId).single();
+    if (existing) return res.json({ ok: true });
+
     try {
       const uid = await generateUniqueUID();
       await supabase1.from('users').insert({
         clerk_id: clerkId, email, first_name: first_name || '', last_name: last_name || '', uid, activated: false, created_at: new Date().toISOString(),
       });
-    } catch (e) {
-      return res.status(500).json({ error: 'Server error' });
-    }
+    } catch (e) {}
   }
   res.status(200).json({ received: true });
 });
 
-// ── GET UID (WITH AUTO-SYNC FIX & ACTIVATION STATUS) ──────────
+// ── GET UID (WITH ACTIVATION STATUS & AUTO-SYNC) ──────────────
 app.post('/api/uid', secureClient, decryptBody, async (req, res) => {
   const { clerkId } = req.decrypted;
   if (!clerkId) return res.status(400).json({ error: 'Missing clerkId' });
 
-  // 🔥 FIX: 'activated' ko select query mein add kiya hai
   let { data, error } = await supabase1.from('users').select('uid, email, first_name, last_name, activated').eq('clerk_id', clerkId).single();
 
   if (error || !data) {
-    console.log(`⚠️ Webhook Missed! Auto-syncing ClerkID: ${clerkId}`);
     const newUid = await generateUniqueUID();
     await supabase1.from('users').insert({
       clerk_id: clerkId, email: 'operator@rmmdm.io', first_name: 'Operator', uid: newUid, activated: false, created_at: new Date().toISOString(),
@@ -115,23 +115,20 @@ app.post('/api/uid', secureClient, decryptBody, async (req, res) => {
     data = { uid: newUid, email: 'operator@rmmdm.io', first_name: 'Operator', last_name: '', activated: false };
   }
   
-  // 🔥 FIX: Frontend ko 'activated' status lazmi bhejna hai
   res.json({ payload: encrypt({ uid: data.uid, email: data.email, firstName: data.first_name, lastName: data.last_name, activated: data.activated }) });
 });
 
-// ── ACTIVATION — Step Validator ───────────────────────────────
+// ── ACTIVATION ────────────────────────────────────────────────
 const STEP_MIN_MS = 5000;
 
 app.post('/api/activation/init', secureClient, decryptBody, async (req, res) => {
   const { clerkId } = req.decrypted;
   if (!clerkId) return res.status(400).json({ error: 'Missing clerkId' });
   
-  // 🔥 FIX: Yahan bhi 'activated' select karna hai
   const { data } = await supabase1.from('users').select('uid, activated').eq('clerk_id', clerkId).single();
   if (!data) return res.status(404).json({ error: 'User not found' });
   
   const token = encrypt({ step: 1, timestamp: Date.now(), uid: data.uid, clerkId });
-  // 🔥 FIX: Frontend ko batana hai ke user already activated hai ya nahi
   res.json({ payload: encrypt({ token, step: 1, alreadyActivated: data.activated }) });
 });
 
@@ -142,44 +139,88 @@ app.post('/api/activation/step', secureClient, decryptBody, async (req, res) => 
   try { prev = decrypt(token); } catch { return res.status(400).json({ error: 'Invalid token' }); }
   const elapsed = Date.now() - prev.timestamp;
   if (elapsed < STEP_MIN_MS) {
-    return res.status(429).json({ error: `Too fast. Wait ${Math.ceil((STEP_MIN_MS - elapsed) / 1000)}s more.` });
+    return res.status(429).json({ error: `Wait ${Math.ceil((STEP_MIN_MS - elapsed) / 1000)}s` });
   }
-  if (nextStep !== prev.step + 1) return res.status(400).json({ error: 'Invalid step sequence' });
+  if (nextStep !== prev.step + 1) return res.status(400).json({ error: 'Invalid step' });
   if (nextStep > 5) return res.status(400).json({ error: 'Already complete' });
 
   const newToken = encrypt({ step: nextStep, timestamp: Date.now(), uid: prev.uid, clerkId: prev.clerkId });
   if (nextStep === 5) {
-    // User finally activate ho raha hai
     await supabase1.from('users').update({ activated: true, activated_at: new Date().toISOString() }).eq('clerk_id', prev.clerkId);
     return res.json({ payload: encrypt({ complete: true, uid: prev.uid }) });
   }
   res.json({ payload: encrypt({ token: newToken, step: nextStep }) });
 });
 
-// ── DEVICE COMMANDS ───────────────────────────────────────────
+// ── DASHBOARD: ADD COMMAND TO QUEUE ───────────────────────────
 app.post('/api/device/command', secureClient, decryptBody, async (req, res) => {
   const { uid, command, params } = req.decrypted;
-  if (!uid || !command) return res.status(400).json({ error: 'Missing uid or command' });
+  if (!uid || !command) return res.status(400).json({ error: 'Missing uid/command' });
   const { data, error } = await supabase2.from('commands').insert({
     uid, command, params: params || {}, status: 'pending', created_at: new Date().toISOString(),
   }).select().single();
-  if (error) return res.status(500).json({ error: 'Failed to queue command' });
+  if (error) return res.status(500).json({ error: 'Queue failed' });
   res.json({ payload: encrypt({ success: true, commandId: data.id }) });
 });
 
-app.post('/api/device/logs', secureClient, decryptBody, async (req, res) => {
+// ── MOBILE APP: FETCH COMMANDS QUEUE (Yeh Route Miss Ho Gaya Tha!) ──
+app.post('/api/device/commands', secureClient, decryptBody, async (req, res) => {
   const { uid } = req.decrypted;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
-  const { data, error } = await supabase2.from('logs').select('*').eq('uid', uid).order('created_at', { ascending: false }).limit(50);
-  if (error) return res.status(500).json({ error: 'Failed to fetch logs' });
+  
+  const { data } = await supabase2.from('commands').select('*').eq('uid', uid).eq('status', 'pending').order('created_at', { ascending: true }).limit(5);
+  
+  if (data && data.length > 0) {
+    const ids = data.map(cmd => cmd.id);
+    await supabase2.from('commands').update({ status: 'processing' }).in('id', ids);
+  }
+  
+  res.json({ payload: encrypt({ commands: data || [] }) });
+});
+
+// ── LOGS: DUAL MODE (INSERT OR FETCH) ─────────────────────────
+app.post('/api/device/logs', secureClient, decryptBody, async (req, res) => {
+  const { uid, event, command, status } = req.decrypted;
+  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
+  // Agar app bhej rahi hai toh insert karo
+  if (event) {
+    await supabase2.from('logs').insert({ uid, event, command, status, created_at: new Date().toISOString() });
+    if (command && status) {
+      await supabase2.from('commands').update({ status }).eq('uid', uid).eq('command', command).eq('status', 'processing');
+    }
+    return res.json({ payload: encrypt({ success: true }) });
+  }
+
+  // Dashboard fetch kar raha hai
+  const { data } = await supabase2.from('logs').select('*').eq('uid', uid).order('created_at', { ascending: false }).limit(50);
   res.json({ payload: encrypt({ logs: data || [] }) });
 });
 
+// ── STATUS: DUAL MODE (UPSERT OR FETCH) ───────────────────────
 app.post('/api/device/status', secureClient, decryptBody, async (req, res) => {
-  const { uid } = req.decrypted;
+  const { uid, battery, online } = req.decrypted;
   if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
+  // App battery bhej rahi hai toh upsert karo
+  if (battery !== undefined) {
+    await supabase2.from('device_status').upsert({
+      uid, battery, online: online !== undefined ? online : true, updated_at: new Date().toISOString()
+    }, { onConflict: 'uid' });
+    return res.json({ payload: encrypt({ success: true }) });
+  }
+
+  // Dashboard fetch kar raha hai
   const { data } = await supabase2.from('device_status').select('*').eq('uid', uid).single();
-  res.json({ payload: encrypt({ status: data || { battery: null, online: false } }) });
+  
+  let isActuallyOnline = data?.online || false;
+  if (data && data.updated_at) {
+    const diff = Date.now() - new Date(data.updated_at).getTime();
+    if (diff > 35000) { isActuallyOnline = false; }
+  }
+
+  const finalStatus = data ? { ...data, online: isActuallyOnline } : { battery: null, online: false, updated_at: null };
+  res.json({ payload: encrypt({ status: finalStatus }) });
 });
 
 // ── Start ─────────────────────────────────────────────────────
@@ -189,5 +230,4 @@ app.listen(PORT, () => {
   console.log(`🚀 RM-MDM Backend running on port ${PORT}`);
 });
 
-// 🔥 VERCEL EXPORT MUST BE HERE
 export default app;
